@@ -11,6 +11,15 @@ const io = new Server(server, { cors: { origin: '*' } });
 const rooms = new Map();
 const LETTERS = 'آابپتثجچحخدذرزژسشصضطظعغفقکگلمنوهی';
 
+const DEFAULT_CATS = [
+  { id: 'name', name: 'اسم', icon: '👤' },
+  { id: 'family', name: 'فامیل', icon: '👨‍👩‍👧‍👦' },
+  { id: 'city', name: 'شهر', icon: '🏙️' },
+  { id: 'country', name: 'کشور', icon: '🌍' },
+  { id: 'food', name: 'غذا', icon: '🍲' },
+  { id: 'animal', name: 'حیوان', icon: '🐾' },
+];
+
 function genCode() {
   const c = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let code = '';
@@ -25,20 +34,18 @@ function randLetter() {
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
 
-  // سرور - فقط بخش create_room تغییر کرده
   socket.on('create_room', ({ playerName, categories }) => {
     let code;
     do { code = genCode(); } while (rooms.has(code));
-  
-    const room = {
-      code,
-      hostId: socket.id,
+    
+    rooms.set(code, {
+      code, hostId: socket.id,
       players: { [socket.id]: { id: socket.id, name: playerName || 'بازیکن', score: 0 } },
       state: 'waiting', round: 1, maxRounds: 5, timePerRound: 60,
       currentLetter: '', answers: {},
-      categories: categories || DEFAULT_CATS,  // ← دسته‌بندی‌های دلخواه
-    };
-    rooms.set(code, room);
+      categories: categories || DEFAULT_CATS,  // ✅ دسته‌بندی‌های دلخواه
+    });
+    
     socket.join(code);
     socket.emit('room_created', { code });
     broadcastRoom(code);
@@ -50,7 +57,7 @@ io.on('connection', (socket) => {
     if (!room) { socket.emit('error', 'اتاق پیدا نشد!'); return; }
     if (room.state !== 'waiting') { socket.emit('error', 'بازی شروع شده!'); return; }
     
-    room.players[socket.id] = { id: socket.id, name: playerName || 'Player', score: 0 };
+    room.players[socket.id] = { id: socket.id, name: playerName || 'بازیکن', score: 0 };
     socket.join(code);
     socket.emit('room_joined', { code });
     broadcastRoom(code);
@@ -165,4 +172,4 @@ function calcResults(room) {
 }
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log('🎮 Server running!'));
+server.listen(PORT, () => console.log('🎮 سرور اسم فامیل روشن شد!'));
