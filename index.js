@@ -25,25 +25,20 @@ function randLetter() {
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
 
-  socket.on('create_room', ({ playerName }) => {
+  // سرور - فقط بخش create_room تغییر کرده
+  socket.on('create_room', ({ playerName, categories }) => {
     let code;
     do { code = genCode(); } while (rooms.has(code));
-    
-    rooms.set(code, {
-      code, hostId: socket.id,
-      players: { [socket.id]: { id: socket.id, name: playerName || 'Player', score: 0 } },
+  
+    const room = {
+      code,
+      hostId: socket.id,
+      players: { [socket.id]: { id: socket.id, name: playerName || 'بازیکن', score: 0 } },
       state: 'waiting', round: 1, maxRounds: 5, timePerRound: 60,
       currentLetter: '', answers: {},
-      categories: [
-        { id: 'name', name: 'اسم', icon: '👤' },
-        { id: 'family', name: 'فامیل', icon: '👨‍👩‍👧‍👦' },
-        { id: 'city', name: 'شهر', icon: '🏙️' },
-        { id: 'country', name: 'کشور', icon: '🌍' },
-        { id: 'food', name: 'غذا', icon: '🍲' },
-        { id: 'animal', name: 'حیوان', icon: '🐾' },
-      ],
-    });
-    
+      categories: categories || DEFAULT_CATS,  // ← دسته‌بندی‌های دلخواه
+    };
+    rooms.set(code, room);
     socket.join(code);
     socket.emit('room_created', { code });
     broadcastRoom(code);
