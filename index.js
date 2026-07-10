@@ -2,23 +2,31 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
+const path = require('path');
 
 const app = express();
 app.use(cors());
-const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
 
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: '*', methods: ['GET', 'POST'] },
+  pingTimeout: 60000,
+  pingInterval: 25000,
+});
+
+app.use(express.static(path.join(__dirname, 'public')));
+
+// ============ DATA ============
 const rooms = new Map();
 const LETTERS = 'آابپتثجچحخدذرزژسشصضطظعغفقکگلمنوهی';
 
-const DEFAULT_CATS = [
-  { id: 'name', name: 'اسم', icon: '👤' },
-  { id: 'family', name: 'فامیل', icon: '👨‍👩‍👧‍👦' },
-  { id: 'city', name: 'شهر', icon: '🏙️' },
-  { id: 'country', name: 'کشور', icon: '🌍' },
-  { id: 'food', name: 'غذا', icon: '🍲' },
-  { id: 'animal', name: 'حیوان', icon: '🐾' },
-];
+// 🔑 امتیازات جدید: ۱۰ یکتا، ۵ مشترک
+const SCORE_UNIQUE = 10;
+const SCORE_SHARED = 5;
+
+// Disconnect grace period (ms) - بازیکن ۶۰ ثانیه فرصت داره reconnect کنه
+const DISCONNECT_GRACE_MS = 60000;
+const disconnectTimers = new Map(); // socketId -> timeout
 
 function genCode() {
   const c = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -31,145 +39,411 @@ function randLetter() {
   return LETTERS[Math.floor(Math.random() * LETTERS.length)];
 }
 
-io.on('connection', (socket) => {
-  console.log('User connected:', socket.id);
+function genToken() {
+  return Math.random().toString(36).substr(2, 12) + Date.now().toString(36);
+}
 
+// ============ SOCKET EVENTS ============
+io.on('connection', (socket) => {
+  console.log('[+] متصل شد:', socket.id);
+
+  // ---- ساخت اتاق ----
   socket.on('create_room', ({ playerName, categories }) => {
+    // اگه توکن قبلی داره، چک کن شاید rejoin باشه
     let code;
     do { code = genCode(); } while (rooms.has(code));
-    
-    rooms.set(code, {
-      code, hostId: socket.id,
-      players: { [socket.id]: { id: socket.id, name: playerName || 'بازیکن', score: 0 } },
-      state: 'waiting', round: 1, maxRounds: 5, timePerRound: 60,
-      currentLetter: '', answers: {},
-      categories: categories || DEFAULT_CATS,  // ✅ دسته‌بندی‌های دلخواه
-    });
-    
+
+    const token = genToken();
+
+    const room = {
+      code,
+      hostId: socket.id,
+      players: {
+        [socket.id]: { id: socket.id, name: playerName || 'بازیکن', score: 0, token }
+      },
+      state: 'waiting',
+      round: 1,
+      maxRounds: 5,
+      timePerRound: 60,
+      currentLetter: '',
+      answers: {},
+      categories: categories && categories.length >= 3 ? categories : [
+        { id: 'name', name: 'اسم', icon: '👤' },
+        { id: 'family', name: 'فامیل', icon: '👨‍👩‍👧‍👦' },
+        { id: 'city', name: 'شهر', icon: '🏙️' },
+        { id: 'country', name: 'کشور', icon: '🌍' },
+        { id: 'food', name: 'غذا', icon: '🍲' },
+        { id: 'animal', name: 'حیوان', icon: '🐾' },
+      ],
+    };
+
+    rooms.set(code, room);
     socket.join(code);
-    socket.emit('room_created', { code });
+    socket.roomCode = code;
+    socket.playerToken = token;
+    socket.emit('room_created', { code, token });
     broadcastRoom(code);
   });
 
+  // ---- ورود به اتاق ----
   socket.on('join_room', ({ roomCode, playerName }) => {
-    const code = roomCode.toUpperCase();
+    const code = (roomCode || '').toUpperCase();
     const room = rooms.get(code);
-    if (!room) { socket.emit('error', 'اتاق پیدا نشد!'); return; }
-    if (room.state !== 'waiting') { socket.emit('error', 'بازی شروع شده!'); return; }
-    
-    room.players[socket.id] = { id: socket.id, name: playerName || 'بازیکن', score: 0 };
+
+    if (!room) {
+      socket.emit('error', 'اتاق پیدا نشد!');
+      return;
+    }
+    if (room.state !== 'waiting') {
+      socket.emit('error', 'بازی شروع شده!');
+      return;
+    }
+    if (Object.keys(room.players).length >= 8) {
+      socket.emit('error', 'اتاق پر شده!');
+      return;
+    }
+
+    const token = genToken();
+    room.players[socket.id] = { id: socket.id, name: playerName || 'بازیکن', score: 0, token };
     socket.join(code);
-    socket.emit('room_joined', { code });
+    socket.roomCode = code;
+    socket.playerToken = token;
+    socket.emit('room_joined', { code, token });
     broadcastRoom(code);
   });
 
-  socket.on('start_game', ({ roomCode }) => {
+  // ---- 🔧 Rejoin بعد از قطع اتصال (حل باگ ۵) ----
+  socket.on('rejoin_room', ({ roomCode, token }) => {
+    const code = (roomCode || '').toUpperCase();
+    const room = rooms.get(code);
+
+    if (!room) {
+      socket.emit('rejoin_failed', 'اتاق پیدا نشد');
+      return;
+    }
+
+    // پیدا کردن بازیکن با token
+    let oldId = null;
+    for (const pid of Object.keys(room.players)) {
+      if (room.players[pid].token === token) {
+        oldId = pid;
+        break;
+      }
+    }
+
+    if (!oldId) {
+      socket.emit('rejoin_failed', 'توکن نامعتبر');
+      return;
+    }
+
+    // انتقال اطلاعات بازیکن از id قدیمی به جدید
+    const playerData = room.players[oldId];
+    delete room.players[oldId];
+    playerData.id = socket.id;
+    room.players[socket.id] = playerData;
+
+    // اگه جواب قبلی ثبت شده بود، منتقل کن
+    if (room.answers[oldId]) {
+      room.answers[socket.id] = room.answers[oldId];
+      delete room.answers[oldId];
+    }
+
+    // اگه host بود، منتقل کن
+    if (room.hostId === oldId) {
+      room.hostId = socket.id;
+    }
+
+    // لغو تایمر disconnect قبلی
+    if (disconnectTimers.has(oldId)) {
+      clearTimeout(disconnectTimers.get(oldId));
+      disconnectTimers.delete(oldId);
+    }
+
+    socket.join(code);
+    socket.roomCode = code;
+    socket.playerToken = token;
+
+    socket.emit('rejoin_success', {
+      code,
+      state: room.state,
+      round: room.round,
+      maxRounds: room.maxRounds,
+      timePerRound: room.timePerRound,
+      categories: room.categories,
+      players: room.players,
+      currentLetter: room.currentLetter,
+      totalScores: (() => {
+        const ts = {};
+        Object.keys(room.players).forEach(pid => { ts[pid] = room.players[pid].score || 0; });
+        return ts;
+      })(),
+    });
+
+    broadcastRoom(code);
+    console.log(`[rejoin] بازیکن ${playerData.name} دوباره وصل شد به اتاق ${code}`);
+  });
+
+  // ---- شروع بازی ----
+  socket.on('start_game', ({ roomCode, categories, maxRounds, timePerRound }) => {
     const room = rooms.get(roomCode);
     if (!room || room.hostId !== socket.id) return;
-    if (Object.keys(room.players).length < 2) { socket.emit('error', 'حداقل ۲ بازیکن لازمه!'); return; }
-    
-    room.state = 'playing'; room.round = 1;
-    room.currentLetter = randLetter(); room.answers = {};
-    
+    if (Object.keys(room.players).length < 2) {
+      socket.emit('error', 'حداقل ۲ بازیکن لازمه!');
+      return;
+    }
+
+    room.state = 'playing';
+    room.round = 1;
+    room.currentLetter = randLetter();
+    room.answers = {};
+    if (categories && categories.length >= 3) room.categories = categories;
+    if (maxRounds) room.maxRounds = maxRounds;
+    if (timePerRound) room.timePerRound = timePerRound;
+
     io.to(roomCode).emit('game_started', {
-      letter: room.currentLetter, round: room.round, maxRounds: room.maxRounds,
-      timePerRound: room.timePerRound, categories: room.categories, players: room.players,
+      letter: room.currentLetter,
+      round: room.round,
+      maxRounds: room.maxRounds,
+      timePerRound: room.timePerRound,
+      categories: room.categories,
+      players: room.players,
     });
     broadcastRoom(roomCode);
   });
 
+  // ---- ثبت جواب‌ها ----
   socket.on('submit_answers', ({ roomCode, answers }) => {
     const room = rooms.get(roomCode);
-    if (!room || room.state !== 'playing') return;
+    if (!room) {
+      socket.emit('error', 'اتاق پیدا نشد!');
+      return;
+    }
+    if (room.state !== 'playing') {
+      socket.emit('submit_ack', { ok: true, msg: 'بازی در حالت دیگری است' });
+      return;
+    }
+
     room.answers[socket.id] = answers;
     socket.emit('answers_received');
-    
+    // تأییدیه فوری بفرست
+    socket.emit('submit_ack', { ok: true });
+
     const total = Object.keys(room.players).length;
     const done = Object.keys(room.answers).length;
+
     io.to(roomCode).emit('answers_progress', { submitted: done, total });
-    if (done >= total) calcResults(room);
+
+    if (done >= total) {
+      calcAndShowResults(room);
+    }
   });
 
+  // ---- 🔧 ویرایش امتیازات توسط میزبان ----
+  socket.on('edit_scores', ({ roomCode, editedScores }) => {
+    const room = rooms.get(roomCode);
+    if (!room || room.hostId !== socket.id) return;
+
+    // editedScores: { playerId: newTotal, ... }
+    if (editedScores && typeof editedScores === 'object') {
+      Object.keys(editedScores).forEach(pid => {
+        if (room.players[pid]) {
+          const newScore = parseInt(editedScores[pid]) || 0;
+          room.players[pid].score = Math.max(0, newScore);
+        }
+      });
+
+      const totalScores = {};
+      Object.keys(room.players).forEach(pid => {
+        totalScores[pid] = room.players[pid].score || 0;
+      });
+
+      io.to(roomCode).emit('scores_updated', { totalScores });
+      broadcastRoom(roomCode);
+    }
+  });
+
+  // ---- دور بعدی ----
   socket.on('next_round', ({ roomCode }) => {
     const room = rooms.get(roomCode);
     if (!room || room.hostId !== socket.id) return;
-    room.round++; room.currentLetter = randLetter(); room.answers = {}; room.state = 'playing';
+
+    room.round++;
+    room.currentLetter = randLetter();
+    room.answers = {};
+    room.state = 'playing';
+
     io.to(roomCode).emit('new_round', {
-      letter: room.currentLetter, round: room.round, maxRounds: room.maxRounds,
-      timePerRound: room.timePerRound, categories: room.categories,
+      letter: room.currentLetter,
+      round: room.round,
+      maxRounds: room.maxRounds,
+      timePerRound: room.timePerRound,
+      categories: room.categories,
     });
     broadcastRoom(roomCode);
   });
 
+  // ---- پایان بازی ----
   socket.on('finish_game', ({ roomCode }) => {
     const room = rooms.get(roomCode);
     if (!room) return;
     room.state = 'finished';
-    const ts = {};
-    Object.keys(room.players).forEach(pid => { ts[pid] = room.players[pid].score || 0; });
-    io.to(roomCode).emit('game_finished', { totalScores: ts, players: room.players });
+    const totalScores = {};
+    Object.keys(room.players).forEach(pid => {
+      totalScores[pid] = room.players[pid].score || 0;
+    });
+    io.to(roomCode).emit('game_finished', { totalScores, players: room.players });
   });
 
+  // ---- بازی دوباره ----
   socket.on('play_again', ({ roomCode }) => {
     const room = rooms.get(roomCode);
     if (!room || room.hostId !== socket.id) return;
-    room.round = 1; room.currentLetter = randLetter(); room.answers = {}; room.state = 'playing';
+    room.round = 1;
+    room.currentLetter = randLetter();
+    room.answers = {};
+    room.state = 'playing';
     Object.keys(room.players).forEach(pid => { room.players[pid].score = 0; });
     io.to(roomCode).emit('new_round', {
-      letter: room.currentLetter, round: room.round, maxRounds: room.maxRounds,
-      timePerRound: room.timePerRound, categories: room.categories,
+      letter: room.currentLetter,
+      round: room.round,
+      maxRounds: room.maxRounds,
+      timePerRound: room.timePerRound,
+      categories: room.categories,
     });
     broadcastRoom(roomCode);
   });
 
+  // ---- ترک اتاق ----
+  socket.on('leave_room', ({ roomCode }) => {
+    leaveRoom(roomCode, socket, true);
+  });
+
+  // ---- 🔧 قطع اتصال با grace period (حل باگ ۵) ----
   socket.on('disconnect', () => {
-    for (const [code, room] of rooms.entries()) {
-      if (room.players[socket.id]) {
-        delete room.players[socket.id];
-        if (Object.keys(room.players).length === 0) rooms.delete(code);
-        else if (room.hostId === socket.id) room.hostId = Object.keys(room.players)[0];
-        broadcastRoom(code);
-        break;
-      }
+    console.log('[-] قطع شد:', socket.id);
+    const code = socket.roomCode;
+    if (!code) return;
+
+    const room = rooms.get(code);
+    if (!room || !room.players[socket.id]) return;
+
+    // اگه بازی هنوز شروع نشده یا تموم شده، فوری حذف کن
+    if (room.state === 'waiting' || room.state === 'finished') {
+      leaveRoom(code, socket, true);
+      return;
     }
+
+    // 🔑 Grace period: ۶۰ ثانیه فرصت rejoin
+    const playerId = socket.id;
+    const playerName = room.players[playerId]?.name || '?';
+    console.log(`[grace] بازیکن ${playerName} قطع شد، ${DISCONNECT_GRACE_MS/1000} ثانیه فرصت بازگشت`);
+
+    // اطلاع به بقیه
+    io.to(code).emit('player_disconnected', {
+      playerId,
+      playerName,
+      graceMs: DISCONNECT_GRACE_MS,
+    });
+
+    const timer = setTimeout(() => {
+      console.log(`[grace-timeout] بازیکن ${playerName} حذف شد از اتاق ${code}`);
+      disconnectTimers.delete(playerId);
+      leaveRoom(code, { id: playerId, roomCode: code }, true);
+    }, DISCONNECT_GRACE_MS);
+
+    disconnectTimers.set(playerId, timer);
   });
 });
 
-function broadcastRoom(code) {
-  const room = rooms.get(code);
+// ============ HELPERS ============
+function leaveRoom(roomCode, socket, immediate) {
+  const room = rooms.get(roomCode);
   if (!room) return;
-  io.to(code).emit('room_update', {
-    code: room.code, hostId: room.hostId, players: room.players,
-    state: room.state, round: room.round,
+
+  const sid = socket.id;
+  if (room.players[sid]) {
+    delete room.players[sid];
+  }
+  if (socket.leave) socket.leave(roomCode);
+
+  if (Object.keys(room.players).length === 0) {
+    rooms.delete(roomCode);
+    return;
+  }
+
+  if (room.hostId === sid) {
+    room.hostId = Object.keys(room.players)[0];
+  }
+
+  broadcastRoom(roomCode);
+}
+
+function broadcastRoom(roomCode) {
+  const room = rooms.get(roomCode);
+  if (!room) return;
+  io.to(roomCode).emit('room_update', {
+    code: room.code,
+    hostId: room.hostId,
+    players: room.players,
+    state: room.state,
+    round: room.round,
   });
 }
 
-function calcResults(room) {
+function calcAndShowResults(room) {
   const results = {};
-  Object.keys(room.players).forEach(pid => { results[pid] = { total: 0, details: {} }; });
-  
+  const totalScores = {};
+
+  Object.keys(room.players).forEach(pid => {
+    results[pid] = { total: 0, details: {} };
+    totalScores[pid] = room.players[pid].score || 0;
+  });
+
   room.categories.forEach(cat => {
     const groups = {};
+
     Object.keys(room.players).forEach(pid => {
       const ans = (room.answers[pid] || {})[cat.id] || '';
-      if (ans.trim()) { const k = ans.trim(); if (!groups[k]) groups[k] = []; groups[k].push(pid); }
+      if (ans.trim()) {
+        const key = ans.trim();
+        if (!groups[key]) groups[key] = [];
+        groups[key].push(pid);
+      }
     });
+
     Object.keys(room.players).forEach(pid => {
       const ans = (room.answers[pid] || {})[cat.id] || '';
-      if (!ans.trim()) { results[pid].details[cat.id] = { answer: '', score: 0 }; return; }
-      const sc = groups[ans.trim()].length === 1 ? 20 : 10;
-      results[pid].details[cat.id] = { answer: ans.trim(), score: sc };
-      results[pid].total += sc;
+      if (!ans.trim()) {
+        results[pid].details[cat.id] = { answer: '', score: 0 };
+        return;
+      }
+      const group = groups[ans.trim()];
+      // 🔑 امتیازات جدید: ۱۰ یکتا، ۵ مشترک
+      const score = group.length === 1 ? SCORE_UNIQUE : SCORE_SHARED;
+      results[pid].details[cat.id] = { answer: ans.trim(), score };
+      results[pid].total += score;
     });
   });
 
-  Object.keys(room.players).forEach(pid => { room.players[pid].score = (room.players[pid].score || 0) + results[pid].total; });
-  const ts = {}; Object.keys(room.players).forEach(pid => { ts[pid] = room.players[pid].score; });
-  
+  Object.keys(room.players).forEach(pid => {
+    room.players[pid].score = (room.players[pid].score || 0) + results[pid].total;
+    totalScores[pid] = room.players[pid].score;
+  });
+
   room.state = 'waiting_next';
-  io.to(room.code).emit('round_results', { results, totalScores: ts, round: room.round, letter: room.currentLetter });
+
+  io.to(room.code).emit('round_results', {
+    results,
+    totalScores,
+    round: room.round,
+    letter: room.currentLetter,
+  });
   broadcastRoom(room.code);
 }
 
+// ============ START SERVER ============
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log('🎮 سرور اسم فامیل روشن شد!'));
+server.listen(PORT, () => {
+  console.log(`🎮 سرور اسم فامیل روی پورت ${PORT} فعال شد`);
+  console.log(`   امتیازات: یکتا=${SCORE_UNIQUE}، مشترک=${SCORE_SHARED}`);
+});
