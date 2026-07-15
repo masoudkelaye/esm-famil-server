@@ -172,6 +172,8 @@ io.on('connection', (socket) => {
       categories: room.categories,
       players: room.players,
       currentLetter: room.currentLetter,
+      skippedPlayers: room.skippedPlayers || [],
+      readyPlayers: room.readyPlayers || {},
       totalScores: (() => {
         const ts = {};
         Object.keys(room.players).forEach(pid => { ts[pid] = room.players[pid].score || 0; });
@@ -196,6 +198,8 @@ io.on('connection', (socket) => {
     room.round = 1;
     room.currentLetter = randLetter();
     room.answers = {};
+    room.skippedPlayers = [];
+    room.readyPlayers = {};
     if (categories && categories.length >= 3) room.categories = categories;
     if (maxRounds) room.maxRounds = maxRounds;
     if (timePerRound) room.timePerRound = timePerRound;
@@ -228,8 +232,10 @@ io.on('connection', (socket) => {
     // تأییدیه فوری بفرست
     socket.emit('submit_ack', { ok: true });
 
-    const total = Object.keys(room.players).length;
-    const done = Object.keys(room.answers).length;
+    const skipped = room.skippedPlayers || [];
+    const activePlayers = Object.keys(room.players).filter(pid => !skipped.includes(pid));
+    const total = activePlayers.length;
+    const done = Object.keys(room.answers).filter(pid => !skipped.includes(pid)).length;
 
     io.to(roomCode).emit('answers_progress', { submitted: done, total });
 
@@ -262,6 +268,54 @@ io.on('connection', (socket) => {
     }
   });
 
+  // ---- 🔧 حذف موقت بازیکن (فقط این راند) ----
+  socket.on('skip_player', ({ roomCode, playerId }) => {
+    const room = rooms.get(roomCode);
+    if (!room || room.hostId !== socket.id) return;
+    if (!room.players[playerId]) return;
+
+    if (!room.skippedPlayers) room.skippedPlayers = [];
+    if (!room.skippedPlayers.includes(playerId)) {
+      room.skippedPlayers.push(playerId);
+    }
+
+    const playerName = room.players[playerId]?.name || '?';
+    io.to(roomCode).emit('player_skipped', {
+      playerId,
+      playerName,
+      skippedPlayers: room.skippedPlayers,
+    });
+    broadcastRoom(roomCode);
+  });
+
+  // ---- 🔧 ریاکشن ----
+  socket.on('send_reaction', ({ roomCode, emoji }) => {
+    const room = rooms.get(roomCode);
+    if (!room) return;
+    const player = room.players[socket.id];
+    if (!player) return;
+
+    io.to(roomCode).emit('reaction_received', {
+      playerId: socket.id,
+      playerName: player.name,
+      emoji,
+    });
+  });
+
+  // ---- 🔧 آماده برای راند بعد ----
+  socket.on('player_ready', ({ roomCode }) => {
+    const room = rooms.get(roomCode);
+    if (!room) return;
+    if (!room.players[socket.id]) return;
+
+    if (!room.readyPlayers) room.readyPlayers = {};
+    room.readyPlayers[socket.id] = true;
+
+    io.to(roomCode).emit('ready_update', {
+      readyPlayers: room.readyPlayers,
+    });
+  });
+
   // ---- دور بعدی ----
   socket.on('next_round', ({ roomCode }) => {
     const room = rooms.get(roomCode);
@@ -271,6 +325,8 @@ io.on('connection', (socket) => {
     room.currentLetter = randLetter();
     room.answers = {};
     room.state = 'playing';
+    room.skippedPlayers = [];
+    room.readyPlayers = {};
 
     io.to(roomCode).emit('new_round', {
       letter: room.currentLetter,
@@ -387,14 +443,17 @@ function broadcastRoom(roomCode) {
     players: room.players,
     state: room.state,
     round: room.round,
+    skippedPlayers: room.skippedPlayers || [],
   });
 }
 
 function calcAndShowResults(room) {
   const results = {};
   const totalScores = {};
+  const skipped = room.skippedPlayers || [];
+  const activePlayers = Object.keys(room.players).filter(pid => !skipped.includes(pid));
 
-  Object.keys(room.players).forEach(pid => {
+  activePlayers.forEach(pid => {
     results[pid] = { total: 0, details: {} };
     totalScores[pid] = room.players[pid].score || 0;
   });
@@ -402,7 +461,7 @@ function calcAndShowResults(room) {
   room.categories.forEach(cat => {
     const groups = {};
 
-    Object.keys(room.players).forEach(pid => {
+    activePlayers.forEach(pid => {
       const ans = (room.answers[pid] || {})[cat.id] || '';
       if (ans.trim()) {
         const key = ans.trim();
@@ -411,32 +470,33 @@ function calcAndShowResults(room) {
       }
     });
 
-    Object.keys(room.players).forEach(pid => {
+    activePlayers.forEach(pid => {
       const ans = (room.answers[pid] || {})[cat.id] || '';
       if (!ans.trim()) {
         results[pid].details[cat.id] = { answer: '', score: 0 };
         return;
       }
       const group = groups[ans.trim()];
-      // 🔑 امتیازات جدید: ۱۰ یکتا، ۵ مشترک
       const score = group.length === 1 ? SCORE_UNIQUE : SCORE_SHARED;
       results[pid].details[cat.id] = { answer: ans.trim(), score };
       results[pid].total += score;
     });
   });
 
-  Object.keys(room.players).forEach(pid => {
+  activePlayers.forEach(pid => {
     room.players[pid].score = (room.players[pid].score || 0) + results[pid].total;
     totalScores[pid] = room.players[pid].score;
   });
 
   room.state = 'waiting_next';
+  room.readyPlayers = {};
 
   io.to(room.code).emit('round_results', {
     results,
     totalScores,
     round: room.round,
     letter: room.currentLetter,
+    readyPlayers: {},
   });
   broadcastRoom(room.code);
 }
