@@ -16,6 +16,11 @@ const io = new Server(server, {
 
 app.use(express.static(path.join(__dirname, 'public')));
 
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', rooms: rooms.size, uptime: process.uptime() });
+});
+
 // ============ DATA ============
 const rooms = new Map();
 const LETTERS = 'آابپتثجچحخدذرزژسشصضطظعغفقکگلمنوهی';
