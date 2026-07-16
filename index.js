@@ -330,6 +330,29 @@ io.on('connection', (socket) => {
     io.to(roomCode).emit('ready_update', {
       readyPlayers: room.readyPlayers,
     });
+
+    // Check if all active players are ready → auto start next round
+    const skipped = room.skippedPlayers || [];
+    const activePlayers = Object.keys(room.players).filter(pid => !skipped.includes(pid));
+    const readyCount = Object.keys(room.readyPlayers).filter(pid => !skipped.includes(pid)).length;
+
+    if (readyCount >= activePlayers.length && activePlayers.length > 0) {
+      room.round++;
+      room.currentLetter = randLetter();
+      room.answers = {};
+      room.state = 'playing';
+      room.skippedPlayers = [];
+      room.readyPlayers = {};
+
+      io.to(roomCode).emit('new_round', {
+        letter: room.currentLetter,
+        round: room.round,
+        maxRounds: room.maxRounds,
+        timePerRound: room.timePerRound,
+        categories: room.categories,
+      });
+      broadcastRoom(roomCode);
+    }
   });
 
   // ---- دور بعدی ----
