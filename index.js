@@ -179,6 +179,7 @@ io.on('connection', (socket) => {
       currentLetter: room.currentLetter,
       skippedPlayers: room.skippedPlayers || [],
       readyPlayers: room.readyPlayers || {},
+      lastResults: room.lastResults || {},
       totalScores: (() => {
         const ts = {};
         Object.keys(room.players).forEach(pid => { ts[pid] = room.players[pid].score || 0; });
@@ -505,6 +506,7 @@ function calcAndShowResults(room) {
 
   room.state = 'waiting_next';
   room.readyPlayers = {};
+  room.lastResults = results;
 
   io.to(room.code).emit('round_results', {
     results,
