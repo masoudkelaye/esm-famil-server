@@ -234,19 +234,29 @@ io.on('connection', (socket) => {
 
     room.answers[socket.id] = answers;
     socket.emit('answers_received');
-    // تأییدیه فوری بفرست
     socket.emit('submit_ack', { ok: true });
 
     const skipped = room.skippedPlayers || [];
     const activePlayers = Object.keys(room.players).filter(pid => !skipped.includes(pid));
-    const total = activePlayers.length;
-    const done = Object.keys(room.answers).filter(pid => !skipped.includes(pid)).length;
 
-    io.to(roomCode).emit('answers_progress', { submitted: done, total });
-
-    if (done >= total) {
-      calcAndShowResults(room);
+    // 🔑 First submit ends the round for everyone!
+    if (Object.keys(room.answers).length === 1) {
+      const playerName = room.players[socket.id]?.name || '?';
+      io.to(roomCode).emit('first_submit', { playerId: socket.id, playerName });
+      
+      // Wait 3 seconds then calculate results
+      if (!room._submitTimer) {
+        room._submitTimer = setTimeout(() => {
+          room._submitTimer = null;
+          if (room.state === 'playing') {
+            calcAndShowResults(room);
+          }
+        }, 3000);
+      }
     }
+
+    const done = Object.keys(room.answers).filter(pid => !skipped.includes(pid)).length;
+    io.to(roomCode).emit('answers_progress', { submitted: done, total: activePlayers.length });
   });
 
   // ---- 🔧 ویرایش امتیازات توسط میزبان ----
