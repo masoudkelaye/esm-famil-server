@@ -433,12 +433,6 @@ io.on('connection', (socket) => {
     const room = rooms.get(code);
     if (!room || !room.players[socket.id]) return;
 
-    // اگه بازی هنوز شروع نشده یا تموم شده، فوری حذف کن
-    if (room.state === 'waiting' || room.state === 'finished') {
-      leaveRoom(code, socket, true);
-      return;
-    }
-
     // 🔑 Grace period: ۶۰ ثانیه فرصت rejoin
     const playerId = socket.id;
     const playerName = room.players[playerId]?.name || '?';
