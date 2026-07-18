@@ -409,6 +409,17 @@ io.on('connection', (socket) => {
   });
 
   // ---- ترک اتاق ----
+  // ---- چت ----
+  socket.on("chat_message", ({ roomCode, message }) => {
+    const room = rooms.get(roomCode);
+    if (!room || !room.players[socket.id]) return;
+    io.to(roomCode).emit("chat_message", {
+      playerId: socket.id,
+      playerName: room.players[socket.id].name,
+      message,
+    });
+  });
+
   socket.on('leave_room', ({ roomCode }) => {
     leaveRoom(roomCode, socket, true);
   });
