@@ -526,6 +526,11 @@ function calcAndShowResults(room) {
         results[pid].details[cat.id] = { answer: '', score: 0 };
         return;
       }
+      // Validate: word must start with the round letter
+      if (!ans.trim().startsWith(room.currentLetter)) {
+        results[pid].details[cat.id] = { answer: ans.trim(), score: 0 };
+        return;
+      }
       const group = groups[ans.trim()];
       const score = group.length === 1 ? SCORE_UNIQUE : SCORE_SHARED;
       results[pid].details[cat.id] = { answer: ans.trim(), score };
