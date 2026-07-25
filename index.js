@@ -249,9 +249,8 @@ io.on('connection', (socket) => {
       if (!room._submitTimer) {
         room._submitTimer = setTimeout(() => {
           room._submitTimer = null;
-          if (room.state === 'playing') {
+          // Always calculate results after first submit
             calcAndShowResults(room);
-          }
         }, 3000);
       }
     }
