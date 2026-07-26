@@ -205,7 +205,6 @@ io.on('connection', (socket) => {
     room.currentLetter = randLetter();
     room.answers = {};
     if (room._submitTimer) { clearTimeout(room._submitTimer); room._submitTimer = null; }
-    if (room._submitTimer) { clearTimeout(room._submitTimer); room._submitTimer = null; }
     room.skippedPlayers = [];
     room.readyPlayers = {};
     if (categories && categories.length >= 3) room.categories = categories;
@@ -342,7 +341,6 @@ io.on('connection', (socket) => {
       room.currentLetter = randLetter();
       room.answers = {};
     if (room._submitTimer) { clearTimeout(room._submitTimer); room._submitTimer = null; }
-    if (room._submitTimer) { clearTimeout(room._submitTimer); room._submitTimer = null; }
       room.state = 'playing';
       room.skippedPlayers = [];
       room.readyPlayers = {};
@@ -366,7 +364,6 @@ io.on('connection', (socket) => {
     room.round++;
     room.currentLetter = randLetter();
     room.answers = {};
-    if (room._submitTimer) { clearTimeout(room._submitTimer); room._submitTimer = null; }
     if (room._submitTimer) { clearTimeout(room._submitTimer); room._submitTimer = null; }
     room.state = 'playing';
     room.skippedPlayers = [];
@@ -401,7 +398,6 @@ io.on('connection', (socket) => {
     room.round = 1;
     room.currentLetter = randLetter();
     room.answers = {};
-    if (room._submitTimer) { clearTimeout(room._submitTimer); room._submitTimer = null; }
     if (room._submitTimer) { clearTimeout(room._submitTimer); room._submitTimer = null; }
     room.state = 'playing';
     Object.keys(room.players).forEach(pid => { room.players[pid].score = 0; });
@@ -543,6 +539,9 @@ function calcAndShowResults(room) {
     room.players[pid].score = (room.players[pid].score || 0) + results[pid].total;
     totalScores[pid] = room.players[pid].score;
   });
+
+  // Clear submit timer
+  if (room._submitTimer) { clearTimeout(room._submitTimer); room._submitTimer = null; }
 
   room.state = 'waiting_next';
   room.readyPlayers = {};
