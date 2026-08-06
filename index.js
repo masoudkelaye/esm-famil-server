@@ -362,6 +362,22 @@ io.on('connection', (socket) => {
     if (!room || room.hostId !== socket.id) return;
 
     room.round++;
+    
+    // Check if game is finished
+    if (room.round > room.maxRounds) {
+      room.state = 'finished';
+      const totalScores = {};
+      Object.keys(room.players).forEach(pid => {
+        totalScores[pid] = room.players[pid].score || 0;
+      });
+      io.to(roomCode).emit('game_finished', {
+        totalScores,
+        players: room.players,
+      });
+      broadcastRoom(roomCode);
+      return;
+    }
+    
     room.currentLetter = randLetter();
     room.answers = {};
     if (room._submitTimer) { clearTimeout(room._submitTimer); room._submitTimer = null; }
