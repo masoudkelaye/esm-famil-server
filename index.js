@@ -13,11 +13,13 @@ const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] }
 });
 
+// Serve static files (harmless if the client is hosted elsewhere, e.g. Netlify)
 app.use(express.static(path.join(__dirname, '..', 'client')));
 app.get('/health', (req, res) => res.json({ ok: true, rooms: rooms.size }));
 
-const rooms = new Map();
-const socketIndex = new Map();
+// ============ DATA ============
+const rooms = new Map();           // code -> room
+const socketIndex = new Map();     // socket.id -> room code (fast disconnect lookup)
 
 const LETTERS = 'آابپتثجچحخدذرزژسشصضطظعغفقکگلمنوهی';
 const DEFAULT_CATS = [
@@ -29,8 +31,8 @@ const DEFAULT_CATS = [
   { id: 'animal',  name: 'حیوان',   icon: '🐾' },
 ];
 
-const DISCONNECT_GRACE_MS = 60000;
-const ROUND_SAFETY_MARGIN_MS = 12000;
+const DISCONNECT_GRACE_MS = 60000;   // keep slot for 1 minute on disconnect/background
+const ROUND_SAFETY_MARGIN_MS = 12000; // extra time added to a round's timer as a server-side safety net
 
 function genCode() {
   const c = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -53,7 +55,9 @@ function sanitizeCategories(categories) {
   return clean.length >= 3 ? clean : DEFAULT_CATS;
 }
 
+// ============ HELPERS ============
 function activePlayerIds(room) {
+  // players currently connected AND not skipped for the running round
   return Object.keys(room.players).filter(pid =>
     room.players[pid].connected !== false && !room.skippedPlayers.includes(pid)
   );
@@ -65,12 +69,6 @@ function publicPlayers(room) {
     const p = room.players[pid];
     out[pid] = { id: pid, name: p.name, score: p.score || 0 };
   });
-  return out;
-}
-
-function publicPlayersScores(room) {
-  const out = {};
-  Object.keys(room.players).forEach(pid => { out[pid] = room.players[pid].score || 0; });
   return out;
 }
 
@@ -97,6 +95,7 @@ function armRoundSafetyTimer(room) {
   room.roundTimer = setTimeout(() => {
     const r = rooms.get(room.code);
     if (!r || r.round !== roundAtArm || r.state !== 'playing') return;
+    // Safety net: force results even if someone never submitted (e.g. tab died silently)
     calcAndShowResults(r);
   }, (room.timePerRound + ROUND_SAFETY_MARGIN_MS / 1000) * 1000);
 }
@@ -107,6 +106,7 @@ function beginRound(room, { isFirst }) {
   room.skippedPlayers = [];
   room.readyPlayers = {};
   room.state = 'playing';
+
   const payload = {
     letter: room.currentLetter,
     round: room.round,
@@ -119,6 +119,8 @@ function beginRound(room, { isFirst }) {
   armRoundSafetyTimer(room);
 }
 
+
+// Persian letter normalization (hamza/alef variants etc.)
 const ALEF_SET = new Set(['ا', 'آ', 'أ', 'إ', 'ٱ']);
 function normalizeLetter(ch) {
   if (!ch) return '';
@@ -132,28 +134,35 @@ function normalizeLetter(ch) {
 function normalizeWord(w) {
   return String(w || '')
     .trim()
-    .replace(/\u200c/g, '')
+    .replace(/\u200c/g, '') // ZWNJ
     .replace(/[‌‍]/g, '')
     .replace(/ي/g, 'ی')
     .replace(/ك/g, 'ک')
     .replace(/ة/g, 'ه')
-    .replace(/[أإٱ]/g, 'ا');
+    .replace(/[أإٱ]/g, 'ا')
+    .replace(/آ/g, 'آ'); // keep آ as distinct start for letter آ
 }
 function startsWithLetter(word, letter) {
   const w = normalizeWord(word);
   if (!w || !letter) return false;
   const first = normalizeLetter(w[0]);
   const need = normalizeLetter(letter);
+  // letter آ matches words starting with آ or ا
   if (need === 'ا' || letter === 'آ') {
     return first === 'ا' || w[0] === 'آ' || ALEF_SET.has(w[0]);
   }
   return first === need;
 }
+// "Real word" heuristic without external dictionary:
+// - only Persian letters (and optional ZWNJ already stripped)
+// - length >= 2
+// - not all same character
+// - has at least one non-alef consonant-ish variety for longer strings
 function isPlausiblePersianWord(word) {
   const w = normalizeWord(word);
   if (w.length < 2) return false;
   if (!/^[\u0600-\u06FF]+$/.test(w)) return false;
-  if (/^(.)\1+$/.test(w)) return false;
+  if (/^(.)\1+$/.test(w)) return false; // اااا / ببب
   if (w.length === 2 && ALEF_SET.has(w[0]) && ALEF_SET.has(w[1])) return false;
   return true;
 }
@@ -174,12 +183,13 @@ function calcAndShowResults(room) {
   const letter = room.currentLetter;
   room.categories.forEach(cat => {
     const groups = {};
+    // normalize key for grouping so "علی" and "علي" count as same
     const normKey = (a) => normalizeWord(a);
     ids.forEach(pid => {
       const ans = (room.answers[pid] || {})[cat.id] || '';
       const trimmed = ans.trim();
       if (!trimmed) return;
-      if (!isValidAnswer(trimmed, letter)) return;
+      if (!isValidAnswer(trimmed, letter)) return; // invalid → no score, not in groups
       const key = normKey(trimmed);
       if (!groups[key]) groups[key] = [];
       groups[key].push(pid);
@@ -199,11 +209,15 @@ function calcAndShowResults(room) {
     });
   });
 
+  // snapshot scores BEFORE adding this round, so host score-edits (which represent
+  // a corrected score for *this round only*) can be re-applied on top of it later
   room.roundBaseScores = {};
   ids.forEach(pid => { room.roundBaseScores[pid] = room.players[pid].score || 0; });
+
   ids.forEach(pid => {
     room.players[pid].score = (room.players[pid].score || 0) + results[pid].total;
   });
+
   const totalScores = {};
   ids.forEach(pid => { totalScores[pid] = room.players[pid].score; });
 
@@ -223,20 +237,26 @@ function removePlayer(code, socketId, { notify }) {
   if (!room || !room.players[socketId]) return;
   const wasHost = room.hostSocketId === socketId;
   const name = room.players[socketId].name;
+
   delete room.players[socketId];
   delete room.answers[socketId];
   delete room.readyPlayers[socketId];
   room.skippedPlayers = room.skippedPlayers.filter(id => id !== socketId);
   socketIndex.delete(socketId);
+
   if (Object.keys(room.players).length === 0) {
     clearRoundTimer(room);
     if (room.discTimers) Object.values(room.discTimers).forEach(t => clearTimeout(t));
     rooms.delete(code);
     return;
   }
+
   if (wasHost) room.hostSocketId = Object.keys(room.players)[0];
+
   if (notify) io.to(code).emit('player_disconnected', { playerName: name });
   broadcastRoom(code);
+
+  // if we were mid-round and this removal completes everyone's answers, resolve the round
   if (room.state === 'playing') {
     const active = activePlayerIds(room);
     const done = active.filter(pid => room.answers[pid]).length;
@@ -244,11 +264,13 @@ function removePlayer(code, socketId, { notify }) {
   }
 }
 
+// ============ SOCKETS ============
 io.on('connection', (socket) => {
   socket.on('create_room', ({ playerName, categories, maxRounds, timePerRound } = {}) => {
     let code;
     do { code = genCode(); } while (rooms.has(code));
     const token = genToken();
+
     const room = {
       code,
       hostSocketId: socket.id,
@@ -281,6 +303,7 @@ io.on('connection', (socket) => {
     if (!room) { socket.emit('error', { message: 'اتاق پیدا نشد!' }); return; }
     if (room.state !== 'waiting') { socket.emit('error', { message: 'بازی شروع شده!' }); return; }
     if (Object.keys(room.players).length >= 8) { socket.emit('error', { message: 'اتاق پر شده!' }); return; }
+
     const token = genToken();
     room.players[socket.id] = { name: (playerName || 'بازیکن').slice(0, 24), score: 0, token, connected: true };
     socketIndex.set(socket.id, code);
@@ -293,24 +316,31 @@ io.on('connection', (socket) => {
     const code = (roomCode || '').toUpperCase();
     const room = rooms.get(code);
     if (!room || !token) { socket.emit('rejoin_failed'); return; }
+
     const oldSocketId = Object.keys(room.players).find(pid => room.players[pid].token === token);
     if (!oldSocketId) { socket.emit('rejoin_failed'); return; }
+
     const wasHost = room.hostSocketId === oldSocketId;
     const player = room.players[oldSocketId];
     player.connected = true;
+
+    // remap every id-keyed structure from the old (dead) socket id to the new one
     if (oldSocketId !== socket.id) {
       delete room.players[oldSocketId];
       room.players[socket.id] = player;
+
       if (room.answers[oldSocketId] !== undefined) { room.answers[socket.id] = room.answers[oldSocketId]; delete room.answers[oldSocketId]; }
       if (room.readyPlayers[oldSocketId] !== undefined) { room.readyPlayers[socket.id] = room.readyPlayers[oldSocketId]; delete room.readyPlayers[oldSocketId]; }
       room.skippedPlayers = room.skippedPlayers.map(id => id === oldSocketId ? socket.id : id);
       if (room.roundBaseScores[oldSocketId] !== undefined) { room.roundBaseScores[socket.id] = room.roundBaseScores[oldSocketId]; delete room.roundBaseScores[oldSocketId]; }
       if (wasHost) room.hostSocketId = socket.id;
+
       socketIndex.delete(oldSocketId);
       if (room.discTimers[oldSocketId]) { clearTimeout(room.discTimers[oldSocketId]); delete room.discTimers[oldSocketId]; }
     }
     socketIndex.set(socket.id, code);
     socket.join(code);
+
     socket.emit('rejoin_success', {
       code: room.code,
       hostId: room.hostSocketId,
@@ -326,6 +356,8 @@ io.on('connection', (socket) => {
       skippedPlayers: room.skippedPlayers,
     });
     broadcastRoom(code);
+
+    // reconnecting might be exactly what a stuck round was waiting on
     if (room.state === 'playing') {
       const active = activePlayerIds(room);
       const done = active.filter(pid => room.answers[pid]).length;
@@ -349,6 +381,7 @@ io.on('connection', (socket) => {
     if (categories) room.categories = sanitizeCategories(categories);
     if (parseInt(maxRounds) >= 1 && parseInt(maxRounds) <= 20) room.maxRounds = parseInt(maxRounds);
     if (parseInt(timePerRound) >= 10 && parseInt(timePerRound) <= 300) room.timePerRound = parseInt(timePerRound);
+
     room.round = 1;
     Object.values(room.players).forEach(p => { p.score = 0; });
     beginRound(room, { isFirst: true });
@@ -360,19 +393,23 @@ io.on('connection', (socket) => {
     const isFirst = Object.keys(room.answers).length === 0;
     room.answers[socket.id] = answers || {};
     socket.emit('submit_ack');
+
     if (isFirst) {
       const name = room.players[socket.id] ? room.players[socket.id].name : 'بازیکن';
       socket.to(roomCode).emit('first_submit', { playerName: name });
     }
+
     const active = activePlayerIds(room);
     const done = active.filter(pid => room.answers[pid]).length;
     io.to(roomCode).emit('answers_progress', { submitted: done, total: active.length });
+
     if (active.length > 0 && done >= active.length) calcAndShowResults(room);
   });
 
   socket.on('next_round', ({ roomCode } = {}) => {
     const room = rooms.get(roomCode);
     if (!room || room.hostSocketId !== socket.id) return;
+
     if (room.round >= room.maxRounds) {
       room.state = 'finished';
       clearRoundTimer(room);
@@ -388,8 +425,10 @@ io.on('connection', (socket) => {
     if (!room || room.hostSocketId !== socket.id) return;
     if (!room.players[playerId]) return;
     if (!room.skippedPlayers.includes(playerId)) room.skippedPlayers.push(playerId);
+
     io.to(roomCode).emit('player_skipped', { playerId, playerName: room.players[playerId].name, skippedPlayers: room.skippedPlayers });
     broadcastRoom(roomCode);
+
     if (room.state === 'playing') {
       const active = activePlayerIds(room);
       const done = active.filter(pid => room.answers[pid]).length;
@@ -435,13 +474,17 @@ io.on('connection', (socket) => {
     if (!code) return;
     const room = rooms.get(code);
     if (!room || !room.players[socket.id]) { socketIndex.delete(socket.id); return; }
+
     room.players[socket.id].connected = false;
-    broadcastRoom(code);
+    broadcastRoom(code); // let others know this player is momentarily offline (still shown, just greyed by client if it wants)
+
+    // if we were mid-round, a disconnected player no longer blocks the round
     if (room.state === 'playing') {
       const active = activePlayerIds(room);
       const done = active.filter(pid => room.answers[pid]).length;
       if (active.length > 0 && done >= active.length) calcAndShowResults(room);
     }
+
     room.discTimers[socket.id] = setTimeout(() => {
       const r = rooms.get(code);
       if (!r || !r.players[socket.id] || r.players[socket.id].connected) return;
@@ -450,5 +493,12 @@ io.on('connection', (socket) => {
   });
 });
 
+function publicPlayersScores(room) {
+  const out = {};
+  Object.keys(room.players).forEach(pid => { out[pid] = room.players[pid].score || 0; });
+  return out;
+}
+
+// ============ START ============
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Esm-Famil server running on port ${PORT}`));
+server.listen(PORT, () => console.log(`🎮 Esm-Famil server running on port ${PORT}`));
