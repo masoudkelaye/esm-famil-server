@@ -1,19 +1,16 @@
 {
   "name": "esm-famil-online",
-  "version": "1.0.0",
+  "version": "4.4.0",
   "description": "بازی آنلاین اسم فامیل",
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js"
   },
   "dependencies": {
+    "an-array-of-persian-words": "^1.0.4",
     "cors": "^2.8.5",
     "express": "^4.18.2",
-    "socket.io": "^4.7.4",
-    "socket.io-client": "^4.8.3"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.2"
+    "socket.io": "^4.7.4"
   },
   "engines": {
     "node": ">=18.0.0"
