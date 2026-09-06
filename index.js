@@ -31,8 +31,19 @@ const DEFAULT_CATS = [
   { id: 'animal', name: 'حیوان', icon: '🐾' },
 ];
 
-// Proper-noun categories: only letter check (no dictionary)
-const PROPER_NOUN_CATS = new Set(['name', 'family', 'city', 'country', 'objects', 'flower', 'car', 'color']);
+// Categories that accept any plausible Persian word starting with letter (names etc.)
+const OPEN_CATS = new Set(['name', 'family', 'city', 'country']);
+
+// Seed lists for category relevance (normalized later)
+const CAT_WORDS = {
+  color: 'قرمز آبی سبز زرد مشکی سفید نارنجی بنفش صورتی قهوه‌ای خاکستری طلایی نقره‌ای فیروزه‌ای یاسی کرم بژ سرمه‌ای نیلی ارغوانی زیتونی فیروزه'.split(' '),
+  animal: 'سگ گربه اسب گاو گوسفند بز شیر ببر پلنگ گرگ روباه خرس فیل زرافه میمون گورخر گوزن کانگورو مرغ خروس اردک غاز کبوتر گنجشک عقاب جغد ماهی کوسه وال دلفین لاک‌پشت مار مارمولک قورباغه پروانه زنبور مورچه موش خرگوش گورکن شتر الاگ گراز یوز پلنگ'.split(' '),
+  fruit: 'سیب پرتقال موز انگور انار هلو زردآلو آلبالو گیلاس گلابی خیار طالبی هندوانه خربزه کیوی انبه آناناس نارگیل لیمو نارنگی خرمالو ازگیل توت شاه‌توت تمشک بلوبری انجیر خرما'.split(' '),
+  food: 'برنج خورش قورمه قرمه فسنجان کباب جوجه قیمه عدس لوبیا آش سوپ سالاد نان پنیر کره تخم‌مرغ پیتزا همبرگر ماکارونی پاستا ساندویچ کتلت کوکو املت عدسی آبگوشت دلمه دلمه‌برگ'.split(' '),
+  car: 'پراید پژو سمند تیبا دنا رانا کوییک شاهین تویوتا هیوندای بنز بی‌ام‌و پورشه فراری لامبورگینی نیسان کیا مزدا فولکس پژو۲۰۶ پژو۴۰۵ سمندEF7 وانت کامیون اتوبوس موتور'.split(' '),
+  flower: 'رز لاله نرگس یاس بنفشه میخک ارکیده سنبل داوودی شمعدانی کاکتوس نیلوفر زنبق آفتابگردان یاسمن نسترن محمدی میخک‌قرمز'.split(' '),
+  objects: 'مداد کتاب میز صندلی گوشی تلفن تلویزیون یخچال ماشین‌لباسشویی لامپ کلید در پنجره کیف کفش عینک ساعت خودکار دفتر کامپیوتر لپ‌تاپ ماوس صفحه کلید'.split(' '),
+};
 
 const DISCONNECT_GRACE_MS = 60000;
 const ROUND_SAFETY_MS = 12000;
@@ -193,14 +204,42 @@ function inDictionary(word) {
   return false;
 }
 
-/** Validate answer for a category */
+function buildCatSet(list) {
+  const set = new Set();
+  for (const raw of list || []) {
+    const n = normalizeWord(raw);
+    if (n.length >= 2) set.add(n);
+    const nospace = n.replace(/\s+/g, '');
+    if (nospace.length >= 2) set.add(nospace);
+  }
+  return set;
+}
+const CAT_SETS = {};
+Object.keys(CAT_WORDS).forEach((k) => { CAT_SETS[k] = buildCatSet(CAT_WORDS[k]); });
+
+/** Validate answer for a category — letter + category relevance */
 function isValidAnswer(word, letter, catId) {
   const w = normalizeWord(word);
   if (!w) return false;
   if (!startsWithLetter(w, letter)) return false;
   if (!isPlausible(w)) return false;
-  // Proper nouns: letter + plausible only
-  if (PROPER_NOUN_CATS.has(catId)) return true;
+
+  // Open categories (names, cities...): any plausible word with correct letter
+  if (OPEN_CATS.has(catId)) return true;
+
+  // Curated lists: exact category match preferred
+  if (CAT_SETS[catId] && CAT_SETS[catId].size > 0) {
+    if (CAT_SETS[catId].has(w)) return true;
+    const nospace = w.replace(/\s+/g, '');
+    if (CAT_SETS[catId].has(nospace)) return true;
+    // color: strict list only (unrelated words get 0)
+    if (catId === 'color') return false;
+    // others: allow real dictionary words (still filters gibberish)
+    if (dictReady) return inDictionary(w);
+    return false;
+  }
+
+  // Unknown categories: dictionary word required
   if (dictReady) return inDictionary(w);
   return true;
 }
