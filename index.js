@@ -127,12 +127,14 @@ function beginRound(room, { isFirst }) {
   room.skippedPlayers = [];
   room.readyPlayers = {};
   room.state = 'playing';
+  room.roundStartedAt = Date.now();
   const payload = {
     letter: room.currentLetter,
     round: room.round,
     maxRounds: room.maxRounds,
     timePerRound: room.timePerRound,
     categories: room.categories,
+    roundStartedAt: room.roundStartedAt,
   };
   io.to(room.code).emit(isFirst ? 'game_started' : 'new_round', payload);
   broadcastRoom(room.code);
@@ -339,14 +341,21 @@ function finishGame(room) {
     lastResults: room.lastResults || {},
     maxRounds: room.maxRounds,
   };
-  // broadcast to room
   io.to(room.code).emit('game_finished', fin);
-  // also emit to every connected player socket directly (host reliability)
-  Object.keys(room.players).forEach((pid) => {
-    try {
-      io.to(pid).emit('game_finished', fin);
-    } catch (e) {}
-  });
+}
+
+// Moves the room from "waiting_next" (showing results) to either the next round
+// or, on the final round, straight to game_finished. Guarded by room.state so a
+// double-tap (or a race between the host's click and an auto-advance) can never
+// fire twice and skip a whole round.
+function advanceRound(room) {
+  if (room.state !== 'waiting_next') return;
+  if (room.round >= room.maxRounds) {
+    finishGame(room);
+    return;
+  }
+  room.round++;
+  beginRound(room, { isFirst: false });
 }
 
 function removePlayer(code, socketId, { notify }) {
@@ -497,6 +506,7 @@ io.on('connection', (socket) => {
       currentLetter: room.currentLetter,
       state: room.state,
       skippedPlayers: room.skippedPlayers,
+      roundStartedAt: room.roundStartedAt || null,
     });
     broadcastRoom(code);
     if (room.state === 'playing') {
@@ -515,6 +525,7 @@ io.on('connection', (socket) => {
   socket.on('start_game', ({ roomCode, categories, maxRounds, timePerRound } = {}) => {
     const room = rooms.get(roomCode);
     if (!room || room.hostSocketId !== socket.id) return;
+    if (room.state !== 'waiting') return; // already started — ignore a duplicate click
     if (Object.keys(room.players).length < 2) {
       socket.emit('error', { message: 'حداقل ۲ بازیکن لازمه!' });
       return;
@@ -529,10 +540,11 @@ io.on('connection', (socket) => {
     beginRound(room, { isFirst: true });
   });
 
-  socket.on('submit_answers', ({ roomCode, answers } = {}) => {
+  socket.on('submit_answers', ({ roomCode, answers, round } = {}) => {
     const room = rooms.get(roomCode);
     if (!room || room.state !== 'playing') return;
     if (!room.players[socket.id]) return;
+    if (round != null && parseInt(round) !== room.round) return; // stale submission from a round that already ended
     const clean = answers && typeof answers === 'object' ? answers : {};
     room.answers[socket.id] = clean;
     // persist by token so reconnect/host doesn't lose answers
@@ -557,12 +569,7 @@ io.on('connection', (socket) => {
   socket.on('next_round', ({ roomCode } = {}) => {
     const room = rooms.get(roomCode);
     if (!room || room.hostSocketId !== socket.id) return;
-    if (room.round >= room.maxRounds) {
-      finishGame(room);
-      return;
-    }
-    room.round++;
-    beginRound(room, { isFirst: false });
+    advanceRound(room);
   });
 
   socket.on('skip_player', ({ roomCode, playerId } = {}) => {
@@ -591,11 +598,12 @@ io.on('connection', (socket) => {
     if (!room) return;
     room.readyPlayers[socket.id] = true;
     io.to(roomCode).emit('ready_update', { readyPlayers: room.readyPlayers });
-    // auto-finish when everyone ready on last round
-    if (room.state === 'waiting_next' && room.round >= room.maxRounds) {
+    // auto-advance once every active player is ready — works for every round,
+    // not just the last one, so the game doesn't stall waiting on an idle host
+    if (room.state === 'waiting_next') {
       const ids = Object.keys(room.players).filter((pid) => room.players[pid].connected !== false);
       const ready = ids.filter((pid) => room.readyPlayers[pid]);
-      if (ids.length >= 1 && ready.length >= ids.length) finishGame(room);
+      if (ids.length >= 1 && ready.length >= ids.length) advanceRound(room);
     }
   });
 
@@ -658,3 +666,14 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log('Esm-Famil v5 server on port', PORT));
+
+// Render's free tier spins the service down after ~15 min with no inbound HTTP
+// traffic, which makes the *next* request take 30-60s to wake back up — this is
+// the most common cause of the app feeling "slow" right after it's been idle.
+// A small self-ping keeps it warm. Only runs when actually deployed on Render.
+const SELF_URL = process.env.RENDER_EXTERNAL_URL;
+if (SELF_URL) {
+  setInterval(() => {
+    fetch(SELF_URL + '/health').catch(() => {});
+  }, 10 * 60 * 1000);
+}
